@@ -1,8 +1,11 @@
 'use strict';
 // services/aiService.js — NASA Wildfire Copilot & Incident AI Intelligence (Emoji-Free Professional Telemetry)
+const https = require('https');
 const fetch = require('node-fetch');
 const settings = require('../config');
 const { getDb } = require('../db/database');
+
+const ipv4Agent = new https.Agent({ family: 4, keepAlive: true });
 
 const SYSTEM_PROMPT = `You are "Orbital Copilot", an elite NASA Earth Science and Wildfire Incident Intelligence AI assistant developed for the GetFire active-fire monitoring platform.
 You analyze real-time satellite telemetry from NASA MODIS (Terra & Aqua, 1km resolution) and VIIRS (Suomi-NPP, NOAA-20, NOAA-21, 375m resolution).
@@ -53,6 +56,7 @@ async function callGeminiApi(prompt, context = {}) {
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify(payload),
       timeout: 15000,
+      agent: ipv4Agent,
     });
 
     if (!response.ok) {
