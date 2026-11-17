@@ -25,11 +25,16 @@ function upsertObservations(normalizedRows) {
 
   const db = getDb();
   const keys = normalizedRows.map(r => r.observation_key);
-  const placeholders = keys.map(() => '?').join(',');
-  const existing = db.prepare(`
-    SELECT observation_key FROM hotspot_observations WHERE observation_key IN (${placeholders})
-  `).all(...keys);
-  const existingSet = new Set(existing.map(r => r.observation_key));
+  const existingSet = new Set();
+  const CHUNK_SIZE = 400;
+  for (let i = 0; i < keys.length; i += CHUNK_SIZE) {
+    const batchKeys = keys.slice(i, i + CHUNK_SIZE);
+    const placeholders = batchKeys.map(() => '?').join(',');
+    const rows = db.prepare(`
+      SELECT observation_key FROM hotspot_observations WHERE observation_key IN (${placeholders})
+    `).all(...batchKeys);
+    for (const r of rows) existingSet.add(r.observation_key);
+  }
 
   const insert = db.prepare(`
     INSERT INTO hotspot_observations
@@ -186,7 +191,8 @@ async function runSync({ sources, west, south, east, north, startDate, endDate }
       harmonizer.aggregateDateRange(sortedDates[0], sortedDates[sortedDates.length - 1]);
     }
 
-    const status = errors.length === 0 ? 'success' : (totalInserted > 0 ? 'partial_failure' : 'failed');
+    const hasData = (totalInserted + totalUpdated + totalFetched) > 0;
+    const status = errors.length === 0 ? 'success' : (hasData ? 'partial_failure' : 'failed');
     db.prepare(`
       UPDATE sync_runs SET records_fetched=?, records_inserted=?, records_updated=?,
         sync_status=?, error_message=?, completed_at_utc=datetime('now') WHERE id=?
