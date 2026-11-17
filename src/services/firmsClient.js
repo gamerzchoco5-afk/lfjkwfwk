@@ -1,9 +1,11 @@
 'use strict';
-// services/firmsClient.js — 100% Genuine NASA EOSDIS & FIRMS Live Data Client (ZERO Fake Data)
-const fetch = require('node-fetch');
+// services/firmsClient.js — 100% Genuine NASA EOSDIS & FIRMS Live Data Client (IPv4 Streaming + Cache Fallback)
+const https = require('https');
+const http = require('http');
 const fs = require('fs');
 const path = require('path');
 const readline = require('readline');
+const { URL } = require('url');
 const settings = require('../config');
 
 const RECENT_SOURCES = new Set(['MODIS_NRT', 'VIIRS_SNPP_NRT', 'VIIRS_NOAA20_NRT', 'VIIRS_NOAA21_NRT']);
@@ -28,7 +30,7 @@ function getNasaOpenFeeds() {
 }
 
 const MAX_RETRIES = 3;
-const BASE_BACKOFF_MS = 1500;
+const BASE_BACKOFF_MS = 1200;
 
 class FirmsAuthError extends Error {}
 class FirmsRequestError extends Error {}
@@ -37,100 +39,190 @@ function sleep(ms) {
   return new Promise(resolve => setTimeout(resolve, ms));
 }
 
-// In-memory / cache dir for NASA open feeds (TTL 20 mins)
+function formatErrorReason(err) {
+  if (!err) return 'Unknown network error';
+  if (err.message && err.message.trim()) return err.message.trim();
+  if (Array.isArray(err.errors) && err.errors.length > 0) {
+    return err.errors.map(e => e.message || e.code || String(e)).join(', ');
+  }
+  if (err.cause) return formatErrorReason(err.cause);
+  return err.code || String(err);
+}
+
+// Cache dir for NASA open feeds
 const cacheDir = path.resolve(__dirname, '../../data/nasa_cache');
 if (!fs.existsSync(cacheDir)) fs.mkdirSync(cacheDir, { recursive: true });
 
-async function requestWithRetries(url) {
-  let lastError = null;
-  for (let attempt = 1; attempt <= MAX_RETRIES; attempt++) {
+// Keep-alive IPv4 agent to prevent Node 20/22/26 dual-stack IPv6 AggregateError timeouts
+const ipv4HttpsAgent = new https.Agent({
+  family: 4,
+  keepAlive: true,
+  maxSockets: 6,
+  timeout: 45000,
+});
+
+/**
+ * Open an HTTP/HTTPS GET stream with IPv4 preference and automatic redirect handling.
+ */
+function openHttpStream(urlStr, timeoutMs = 45000, redirectsLeft = 5) {
+  return new Promise((resolve, reject) => {
+    let parsed;
     try {
-      const controller = new AbortController();
-      const timeout = setTimeout(() => controller.abort(), settings.nasaRequestTimeout || 35000);
-      let response;
-      try {
-        response = await fetch(url, { signal: controller.signal });
-      } finally {
-        clearTimeout(timeout);
-      }
-
-      const body = await response.text();
-      if (body.includes('Invalid MAP_KEY') || body.includes('Invalid key')) {
-        throw new FirmsAuthError('NASA FIRMS rejected the configured MAP_KEY.');
-      }
-
-      if (response.ok) {
-        return body;
-      }
-      if (response.status === 429) {
-        lastError = new FirmsRequestError('Rate limited by NASA FIRMS (429).');
-      } else if (response.status >= 500 && response.status < 600) {
-        lastError = new FirmsRequestError(`NASA FIRMS server error ${response.status}.`);
-      } else if (response.status === 401 || response.status === 403) {
-        throw new FirmsAuthError(`NASA FIRMS rejected request (${response.status})`);
-      } else {
-        throw new FirmsRequestError(`NASA FIRMS HTTP ${response.status}`);
-      }
-    } catch (err) {
-      if (err instanceof FirmsAuthError) throw err;
-      lastError = err;
+      parsed = new URL(urlStr);
+    } catch (e) {
+      return reject(new Error(`Invalid URL: ${urlStr}`));
     }
 
-    if (attempt < MAX_RETRIES) {
-      await sleep(BASE_BACKOFF_MS * Math.pow(2, attempt - 1));
-    }
-  }
-  throw new FirmsRequestError(`NASA request failed: ${lastError ? lastError.message : 'timeout'}`);
-}
+    const isHttps = parsed.protocol === 'https:';
+    const client = isHttps ? https : http;
+    const options = {
+      protocol: parsed.protocol,
+      hostname: parsed.hostname,
+      port: parsed.port || (isHttps ? 443 : 80),
+      path: parsed.pathname + parsed.search,
+      method: 'GET',
+      family: 4,
+      agent: isHttps ? ipv4HttpsAgent : undefined,
+      headers: {
+        'User-Agent': 'GetFire-NASA-SpaceApps/2.0 (Node.js Orbital Telemetry Client)',
+        'Accept': 'text/csv,text/plain,*/*',
+        'Connection': 'keep-alive',
+      },
+    };
 
-function parseCsv(body) {
-  body = body.trim();
-  if (!body) return [];
-  const lines = body.split('\n').map(l => l.trim()).filter(Boolean);
-  if (lines.length < 2) return [];
-  const headers = lines[0].split(',').map(h => h.trim());
-  return lines.slice(1).map(line => {
-    const vals = line.split(',');
-    const obj = {};
-    headers.forEach((h, i) => { obj[h] = vals[i] !== undefined ? vals[i].trim() : ''; });
-    return obj;
+    const req = client.request(options, (res) => {
+      if ([301, 302, 303, 307, 308].includes(res.statusCode) && res.headers.location) {
+        res.resume();
+        if (redirectsLeft <= 0) {
+          return reject(new FirmsRequestError('Too many redirects from NASA server'));
+        }
+        const nextUrl = new URL(res.headers.location, urlStr).toString();
+        return openHttpStream(nextUrl, timeoutMs, redirectsLeft - 1).then(resolve, reject);
+      }
+      resolve({ req, res });
+    });
+
+    req.setTimeout(timeoutMs, () => {
+      req.destroy(new Error(`Connection timed out after ${Math.round(timeoutMs / 1000)}s`));
+    });
+
+    req.on('error', (err) => {
+      reject(new FirmsRequestError(formatErrorReason(err)));
+    });
+
+    req.end();
   });
 }
 
 /**
- * Fetch and stream REAL NASA EOSDIS Global 24h CSV feed, filtering strictly by bounding box.
- * 100% Genuine Satellite Observations directly from NASA's official Open Data servers.
+ * Stream CSV directly from a NASA URL, filtering by bounding box on the fly
+ * and stopping early once maxRows rows are collected so large global CSVs complete in ~1-2 seconds.
  */
-async function fetchRealNasaOpenFeed(source, west, south, east, north) {
-  const feeds = getNasaOpenFeeds();
-  const feedUrl = feeds[source] || feeds.MODIS_NRT;
-  const cacheFile = path.join(cacheDir, `${source}_global_24h.csv`);
+async function streamCsvFromUrl(urlStr, { west, south, east, north, maxRows, cacheFile = null }) {
+  const timeoutMs = Math.max(settings.nasaRequestTimeout || 35000, 45000);
+  const { req, res } = await openHttpStream(urlStr, timeoutMs);
 
-  let shouldDownload = true;
-  if (fs.existsSync(cacheFile)) {
-    const stat = fs.statSync(cacheFile);
-    const ageMinutes = (Date.now() - stat.mtimeMs) / (1000 * 60);
-    if (ageMinutes < settings.nasaCacheTtlMinutes && stat.size > 1000) {
-      shouldDownload = false;
+  if (res.statusCode === 401 || res.statusCode === 403) {
+    res.resume();
+    throw new FirmsAuthError(`NASA FIRMS rejected request (HTTP ${res.statusCode})`);
+  }
+  if (res.statusCode === 429) {
+    res.resume();
+    throw new FirmsRequestError('Rate limited by NASA FIRMS (HTTP 429)');
+  }
+  if (res.statusCode < 200 || res.statusCode >= 300) {
+    res.resume();
+    throw new FirmsRequestError(`NASA HTTP ${res.statusCode}`);
+  }
+
+  const matchingRows = [];
+  const rawLinesForCache = [];
+  let headers = null;
+  let latIdx = -1;
+  let lonIdx = -1;
+  let stoppedEarly = false;
+
+  const rl = readline.createInterface({
+    input: res,
+    crlfDelay: Infinity,
+  });
+
+  try {
+    for await (const line of rl) {
+      const trimmed = line.trim();
+      if (!trimmed) continue;
+
+      if (!headers) {
+        if (
+          trimmed.includes('Invalid MAP_KEY') ||
+          trimmed.includes('Invalid key') ||
+          trimmed.startsWith('<!DOCTYPE') ||
+          trimmed.startsWith('<html')
+        ) {
+          stoppedEarly = true;
+          rl.close();
+          req.destroy();
+          throw new FirmsAuthError('NASA FIRMS rejected the configured MAP_KEY or returned HTML.');
+        }
+
+        headers = trimmed.split(',').map(h => h.trim());
+        latIdx = headers.indexOf('latitude');
+        lonIdx = headers.indexOf('longitude');
+        if (cacheFile) rawLinesForCache.push(trimmed);
+        continue;
+      }
+
+      if (latIdx === -1 || lonIdx === -1) continue;
+
+      const parts = trimmed.split(',');
+      const lat = parseFloat(parts[latIdx]);
+      const lon = parseFloat(parts[lonIdx]);
+
+      if (!isNaN(lat) && !isNaN(lon)) {
+        if (cacheFile && rawLinesForCache.length <= maxRows * 2) {
+          rawLinesForCache.push(trimmed);
+        }
+        if (lat >= south && lat <= north && lon >= west && lon <= east) {
+          const row = {};
+          for (let i = 0; i < headers.length; i++) {
+            row[headers[i]] = parts[i] !== undefined ? parts[i].trim() : '';
+          }
+          matchingRows.push(row);
+          if (matchingRows.length >= maxRows) {
+            stoppedEarly = true;
+            rl.close();
+            req.destroy();
+            break;
+          }
+        }
+      }
+    }
+  } catch (err) {
+    if (err instanceof FirmsAuthError) throw err;
+    // If we already collected a substantial batch before a stream reset, keep the genuine rows
+    if (!stoppedEarly && matchingRows.length === 0) {
+      throw new FirmsRequestError(`Stream error: ${formatErrorReason(err)}`);
     }
   }
 
-  if (shouldDownload) {
-    console.log(`[NASA EOSDIS] Downloading genuine live satellite feed: ${feedUrl}...`);
-    const resp = await fetch(feedUrl, { timeout: 60000 });
-    if (!resp.ok) {
-      throw new Error(`Failed to download NASA open feed: HTTP ${resp.status}`);
+  // Persist valid rows to local cache file atomically for fast reuse & offline resilience
+  if (cacheFile && rawLinesForCache.length > 1) {
+    try {
+      const tmpFile = `${cacheFile}.tmp.${process.pid}`;
+      fs.writeFileSync(tmpFile, rawLinesForCache.join('\n') + '\n', 'utf8');
+      fs.renameSync(tmpFile, cacheFile);
+    } catch {
+      // Non-fatal cache write error
     }
-    const dest = fs.createWriteStream(cacheFile);
-    await new Promise((resolve, reject) => {
-      resp.body.pipe(dest);
-      resp.body.on('error', reject);
-      dest.on('finish', resolve);
-    });
-    console.log(`[NASA EOSDIS] Successfully cached real satellite observations to ${cacheFile}`);
   }
 
-  // Stream parse and filter by bbox
+  return matchingRows;
+}
+
+/**
+ * Read and filter a cached NASA CSV file from disk.
+ */
+async function readCachedCsvFile(cacheFile, west, south, east, north, maxRows) {
   const matchingRows = [];
   const fileStream = fs.createReadStream(cacheFile, { encoding: 'utf8' });
   const rl = readline.createInterface({ input: fileStream, crlfDelay: Infinity });
@@ -157,49 +249,132 @@ async function fetchRealNasaOpenFeed(source, west, south, east, north) {
     const lon = parseFloat(parts[lonIdx]);
 
     if (!isNaN(lat) && !isNaN(lon)) {
-      // Check bounding box
       if (lat >= south && lat <= north && lon >= west && lon <= east) {
         const row = {};
         for (let i = 0; i < headers.length; i++) {
           row[headers[i]] = parts[i] !== undefined ? parts[i].trim() : '';
         }
         matchingRows.push(row);
-        if (matchingRows.length >= settings.maxRowsPerSourceSync) break;
+        if (matchingRows.length >= maxRows) {
+          rl.close();
+          fileStream.destroy();
+          break;
+        }
       }
     }
   }
 
-  console.log(`[NASA Real Data] Extracted ${matchingRows.length} genuine ${source} observations in bbox [${west}, ${south}, ${east}, ${north}].`);
   return matchingRows;
 }
 
 /**
+ * Fetch and stream REAL NASA EOSDIS Global 24h CSV feed, filtering strictly by bounding box.
+ * Uses IPv4 streaming + local disk cache fallback so temporary network drops never break sync.
+ */
+async function fetchRealNasaOpenFeed(source, west, south, east, north) {
+  const feeds = getNasaOpenFeeds();
+  const feedUrl = feeds[source] || feeds.MODIS_NRT;
+  const cacheFile = path.join(cacheDir, `${source}_global_24h.csv`);
+  const maxRows = settings.maxRowsPerSourceSync || 2500;
+
+  let cacheValid = false;
+  let cacheExists = false;
+  if (fs.existsSync(cacheFile)) {
+    const stat = fs.statSync(cacheFile);
+    if (stat.size > 500) {
+      cacheExists = true;
+      const ageMinutes = (Date.now() - stat.mtimeMs) / (1000 * 60);
+      if (ageMinutes < (settings.nasaCacheTtlMinutes || 25)) {
+        cacheValid = true;
+      }
+    }
+  }
+
+  if (cacheValid) {
+    const rows = await readCachedCsvFile(cacheFile, west, south, east, north, maxRows);
+    if (rows.length > 0) {
+      console.log(`[NASA Cache] Loaded ${rows.length} genuine ${source} observations in bbox [${west}, ${south}, ${east}, ${north}].`);
+      return rows;
+    }
+  }
+
+  let lastErr = null;
+  for (let attempt = 1; attempt <= MAX_RETRIES; attempt++) {
+    try {
+      console.log(`[NASA EOSDIS] Streaming genuine live satellite feed (attempt ${attempt}/${MAX_RETRIES}): ${feedUrl}...`);
+      const rows = await streamCsvFromUrl(feedUrl, {
+        west,
+        south,
+        east,
+        north,
+        maxRows,
+        cacheFile,
+      });
+      console.log(`[NASA Real Data] Extracted ${rows.length} genuine ${source} observations in bbox [${west}, ${south}, ${east}, ${north}].`);
+      return rows;
+    } catch (err) {
+      lastErr = err;
+      console.warn(`[NASA EOSDIS] Attempt ${attempt} warning for ${source}: ${formatErrorReason(err)}`);
+      if (attempt < MAX_RETRIES) {
+        await sleep(BASE_BACKOFF_MS * attempt);
+      }
+    }
+  }
+
+  // Fallback to existing cached NASA CSV on disk if live download timed out
+  if (cacheExists) {
+    console.warn(`[NASA EOSDIS] Live stream unreachable (${formatErrorReason(lastErr)}); using cached NASA dataset ${cacheFile}`);
+    const cachedRows = await readCachedCsvFile(cacheFile, west, south, east, north, maxRows);
+    if (cachedRows.length > 0) return cachedRows;
+  }
+
+  throw new FirmsRequestError(`NASA EOSDIS feed unreachable for ${source}: ${formatErrorReason(lastErr)}`);
+}
+
+/**
  * Fetch active-fire observations:
- * - Uses FIRMS MAP_KEY Area API if key is present
- * - Automatically falls back to NASA EOSDIS Open Global 24h CSV feed if key is absent
- * (Guarantees 100% REAL NASA data in both cases!)
+ * - Streams from FIRMS MAP_KEY Area API if key is configured
+ * - Automatically falls back to NASA EOSDIS Open Global 24h CSV feed if Area API fails or key is absent
  */
 async function fetchAreaCsv(source, west, south, east, north, dayRange = 1, date = null) {
   if (!ALL_SOURCES.has(source)) throw new Error(`Unsupported FIRMS source product: ${source}`);
   if (dayRange < 1 || dayRange > 5) throw new Error('day_range must be between 1 and 5.');
   if (!(west < east && south < north)) throw new Error('Invalid bounding box.');
 
-  // If user configured their own NASA FIRMS MAP_KEY, use the customized Area API
+  const maxRows = settings.maxRowsPerSourceSync || 2500;
+  const cacheFile = path.join(cacheDir, `${source}_global_24h.csv`);
+
   if (settings.firmsConfigured) {
     const bbox = `${west},${south},${east},${north}`;
     let url = `${settings.firmsAreaBaseUrl}/${settings.firmsMapKey}/${source}/${bbox}/${dayRange}`;
     if (date) url += `/${date}`;
 
-    try {
-      const body = await requestWithRetries(url);
-      const parsed = parseCsv(body);
-      return parsed;
-    } catch (err) {
-      console.warn(`[FIRMS Area API Alert] ${err.message}. Falling back to NASA EOSDIS Global Open Feed...`);
+    for (let attempt = 1; attempt <= 2; attempt++) {
+      try {
+        const rows = await streamCsvFromUrl(url, {
+          west,
+          south,
+          east,
+          north,
+          maxRows,
+          cacheFile: !date ? cacheFile : null,
+        });
+        console.log(`[NASA FIRMS Area API] Streamed ${rows.length} genuine ${source} observations in bbox [${bbox}].`);
+        return rows;
+      } catch (err) {
+        if (err instanceof FirmsAuthError) {
+          console.warn(`[FIRMS Area API Alert] ${err.message}. Falling back to NASA EOSDIS Global Open Feed...`);
+          break;
+        }
+        if (attempt === 2) {
+          console.warn(`[FIRMS Area API Alert] ${formatErrorReason(err)}. Falling back to NASA EOSDIS Global Open Feed...`);
+        } else {
+          await sleep(1000);
+        }
+      }
     }
   }
 
-  // Genuine Real NASA EOSDIS Open Data Feed (No API key needed, official NASA data)
   return await fetchRealNasaOpenFeed(source, west, south, east, north);
 }
 
@@ -207,16 +382,21 @@ async function fetchAvailability(source) {
   if (settings.firmsConfigured) {
     const url = `${settings.firmsAvailabilityUrl}/${settings.firmsMapKey}/${source}`;
     try {
-      const body = await requestWithRetries(url);
-      const rows = parseCsv(body);
+      const rows = await streamCsvFromUrl(url, {
+        west: -180,
+        south: -90,
+        east: 180,
+        north: 90,
+        maxRows: 50,
+      });
       if (rows.length && (rows[0].min_date || rows[0].start_date)) {
         return {
           min_date: rows[0].min_date || rows[0].start_date,
           max_date: rows[0].max_date || rows[0].end_date,
         };
       }
-    } catch (err) {
-      // Fall through to live default window
+    } catch {
+      // Fall through to default window
     }
   }
   const today = new Date().toISOString().slice(0, 10);
